@@ -1,0 +1,25 @@
+# Node & Expo
+node_modules/
+.expo/
+dist/
+web-build/
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+*.log
+
+# Android & Gradle
+.gradle/
+build/
+app/build/
+*.iml
+.idea/
+.kotlin/
+local.properties
+.externalNativeBuild/
+.cxx/
+captures/
+
+# OS specific
+.DS_Store
+Thumbs.db
