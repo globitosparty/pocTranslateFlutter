@@ -201,6 +201,96 @@ export function cleanAndGroupParagraphs(
 let webOcrWorker: any = null;
 
 /**
+ * Detects whether a candidate bounding box sits on top of a charcoal/pencil sketch,
+ * dark shadow, or face portrait rather than a clean, high-contrast text paper background.
+ */
+export function isBoxOverShadedArtwork(canvas: HTMLCanvasElement, box: BoundingBox): boolean {
+  try {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return false;
+    const cw = canvas.width;
+    const ch = canvas.height;
+    const x = Math.max(0, Math.floor(box.x * cw));
+    const y = Math.max(0, Math.floor(box.y * ch));
+    const w = Math.min(cw - x, Math.floor(box.width * cw));
+    const h = Math.min(ch - y, Math.floor(box.height * ch));
+
+    if (w < 8 || h < 8) return false;
+
+    // Sample pixels across the candidate bounding box
+    const imgData = ctx.getImageData(x, y, w, h);
+    const data = imgData.data;
+    let lightPixels = 0;
+    let midGrayPixels = 0;
+    let sampleCount = 0;
+
+    for (let i = 0; i < data.length; i += 16) {
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+      const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+      if (brightness > 215) {
+        lightPixels++;
+      } else if (brightness >= 70 && brightness <= 200) {
+        midGrayPixels++;
+      }
+      sampleCount++;
+    }
+
+    if (sampleCount === 0) return false;
+
+    const lightRatio = lightPixels / sampleCount;
+    const midGrayRatio = midGrayPixels / sampleCount;
+
+    // Real text on paper has predominantly clean white/cream background (>= 50%).
+    // Charcoal drawings, face portraits, and sketches have high mid-gray graphite density (> 42%) and low clean paper (< 38%).
+    if (midGrayRatio > 0.42 && lightRatio < 0.38) {
+      return true; // Over shaded artwork / drawing!
+    }
+  } catch {
+    // If canvas cannot be sampled, fail safe
+  }
+  return false;
+}
+
+/**
+ * Detects faces on the page canvas using Chromium's native Shape Detection API if available.
+ */
+async function detectFacesOnCanvas(canvas: HTMLCanvasElement): Promise<BoundingBox[]> {
+  if (typeof window !== 'undefined' && typeof (window as any).FaceDetector === 'function') {
+    try {
+      const FaceDetectorClass = (window as any).FaceDetector;
+      const detector = new FaceDetectorClass({ fastMode: true, maxDetectedFaces: 10 });
+      const faces = await detector.detect(canvas);
+      const cw = canvas.width;
+      const ch = canvas.height;
+      return (faces || []).map((f: any) => ({
+        x: Math.max(0, f.boundingBox.x / cw),
+        y: Math.max(0, f.boundingBox.y / ch),
+        width: Math.min(1, f.boundingBox.width / cw),
+        height: Math.min(1, f.boundingBox.height / ch)
+      }));
+    } catch {
+      // Shape detection not supported or failed
+    }
+  }
+  return [];
+}
+
+function isBoxInsideFace(box: BoundingBox, faces: BoundingBox[]): boolean {
+  for (const f of faces) {
+    const xOverlap = Math.max(0, Math.min(box.x + box.width, f.x + f.width) - Math.max(box.x, f.x));
+    const yOverlap = Math.max(0, Math.min(box.y + box.height, f.y + f.height) - Math.max(box.y, f.y));
+    const overlapArea = xOverlap * yOverlap;
+    const boxArea = box.width * box.height;
+    if (boxArea > 0 && (overlapArea / boxArea) > 0.35) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Attempts to call Google Lens OCR via local backend/Metro endpoint.
  * Returns high-accuracy line items with normalized bounding boxes.
  */
@@ -225,7 +315,8 @@ async function callLensOcr(dataUrl: string): Promise<RawLineItem[] | null> {
       clearTimeout(timer);
       if (res.ok) {
         const data = await res.json();
-        if (data && data.success && Array.isArray(data.items) && data.items.length > 0) {
+        // If Google Lens successfully analyzed the image
+        if (data && data.success && Array.isArray(data.items)) {
           const validItems: RawLineItem[] = [];
           for (const it of data.items) {
             const txt = (it.text || '').replace(/\s+/g, ' ').trim();
@@ -236,10 +327,9 @@ async function callLensOcr(dataUrl: string): Promise<RawLineItem[] | null> {
               });
             }
           }
-          if (validItems.length > 0) {
-            console.log(`[Google Lens OCR] Obtenidas ${validItems.length} líneas limpias con coordenadas exactas.`);
-            return validItems;
-          }
+          console.log(`[Google Lens OCR] Respuesta recibida (${validItems.length} líneas detectadas).`);
+          // Return validItems (even if empty, meaning Google Lens verified there is no text)
+          return validItems;
         }
       }
     } catch {
@@ -256,18 +346,23 @@ async function ocrWebPage(page: any): Promise<RawLineItem[]> {
   canvas.height = viewport.height;
   await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
 
-  // 1. Try Google Lens OCR first (high precision, exact bounding boxes, eliminates noise)
+  // 1. Try Google Lens OCR first (authoritative: if it returns 0 items, it's a pure drawing/face!)
   try {
     const dataUrl = canvas.toDataURL('image/jpeg', 0.88);
     const lensItems = await callLensOcr(dataUrl);
-    if (lensItems && lensItems.length > 0) {
+    if (lensItems !== null) {
+      // If Google Lens responded, its verdict is authoritative.
+      // If lensItems is empty, the page is an illustration/face portrait. Do NOT fall back to Tesseract!
       return lensItems;
     }
   } catch (err) {
     console.warn('[ocrWebPage] Lens OCR no respondió, recurriendo a Tesseract fallback:', err);
   }
 
-  // 2. Fallback to Tesseract.js if Lens OCR endpoint is unreachable
+  // 2. Detect faces on canvas to suppress hallucinations
+  const detectedFaces = await detectFacesOnCanvas(canvas);
+
+  // 3. Fallback to Tesseract.js ONLY if Lens OCR endpoint is completely unreachable
   const win = window as any;
   if (!win.Tesseract) {
     await new Promise<void>((resolve, reject) => {
@@ -291,19 +386,22 @@ async function ocrWebPage(page: any): Promise<RawLineItem[]> {
   if (result.data?.lines && result.data.lines.length > 0) {
     for (const line of result.data.lines) {
       const clean = (line.text || '').replace(/\s+/g, ' ').trim();
-      // Skip OCR sketch noise
+      // Skip OCR sketch and drawing noise
       if (isOcrNoise(clean)) continue;
 
       if (clean.length >= 2 && line.bbox && line.bbox.x1 > line.bbox.x0 && line.bbox.y1 > line.bbox.y0) {
-        items.push({
-          text: clean,
-          box: {
-            x: Math.max(0, Math.min(1, line.bbox.x0 / cw)),
-            y: Math.max(0, Math.min(1, line.bbox.y0 / ch)),
-            width: Math.max(0.01, Math.min(1, (line.bbox.x1 - line.bbox.x0) / cw)),
-            height: Math.max(0.01, Math.min(1, (line.bbox.y1 - line.bbox.y0) / ch))
-          }
-        });
+        const box: BoundingBox = {
+          x: Math.max(0, Math.min(1, line.bbox.x0 / cw)),
+          y: Math.max(0, Math.min(1, line.bbox.y0 / ch)),
+          width: Math.max(0.01, Math.min(1, (line.bbox.x1 - line.bbox.x0) / cw)),
+          height: Math.max(0.01, Math.min(1, (line.bbox.y1 - line.bbox.y0) / ch))
+        };
+
+        // Suppress if inside a detected face or over shaded drawing artwork
+        if (detectedFaces.length > 0 && isBoxInsideFace(box, detectedFaces)) continue;
+        if (isBoxOverShadedArtwork(canvas, box)) continue;
+
+        items.push({ text: clean, box });
       }
     }
   }

@@ -146,6 +146,50 @@ export function isCoherentEnglishWord(rawWord: string): boolean {
 }
 
 /**
+ * Detects whether a text snippet exhibits the statistical signature of OCR hallucination
+ * over charcoal drawings, pencil sketches, cross-hatching, hair, wrinkles, or face shading.
+ */
+export function isDrawingOrSketchNoise(text: string): boolean {
+  const clean = (text || '').trim();
+  if (clean.length < 2) return true;
+
+  const tokens = clean
+    .split(/\s+/)
+    .map(t => t.replace(/^[^\w]+|[^\w]+$/g, ''))
+    .filter(Boolean);
+
+  if (tokens.length === 0) return true;
+
+  // 1. Single invalid letters: in English only 'a', 'I', or single digits '0'-'9' can stand as tokens.
+  // Any stray 'H', 'c', 'x', 'r', 'e', 'b', 'd', 's', 'm' indicates pencil sketch noise.
+  const invalidSingleLetters = tokens.filter(t => t.length === 1 && !/^[aiAI0-9]$/.test(t));
+  if (invalidSingleLetters.length > 0) return true;
+
+  // 2. Repeated single letters: e.g. 'a a', 'a a a', 'i i', 'x x'
+  if (/\b([a-zA-Z])\s+\1\b/i.test(clean)) return true;
+
+  // 3. Average word length check for 3+ words:
+  // Real English text averages 4.5 - 5.8 characters per word.
+  // Drawing hallucinations average 2.1 - 2.8 characters per word.
+  const totalChars = tokens.reduce((acc, t) => acc + t.length, 0);
+  const avgLen = totalChars / tokens.length;
+  if (tokens.length >= 3 && avgLen < 3.1) return true;
+
+  // 4. Short word ratio (<= 2 chars) for 4+ words:
+  // In real English sentences, <= 2 char words are <= 35% of tokens.
+  // In drawing noise, <= 2 char words are 55-80% of tokens.
+  const shortTokens = tokens.filter(t => t.length <= 2);
+  const shortRatio = shortTokens.length / tokens.length;
+  if (tokens.length >= 4 && shortRatio > 0.44) return true;
+
+  // 5. Check random uppercase 2-3 char fragments scattered inside text (e.g. 'ENA', 'ERS', 'NR', 'CRA', 'TR', 'EER')
+  const scatteredUpper = tokens.filter(t => t.length >= 2 && t.length <= 3 && t === t.toUpperCase() && !/^\d+$/.test(t));
+  if (tokens.length >= 4 && scatteredUpper.length >= 2 && (scatteredUpper.length / tokens.length) > 0.22) return true;
+
+  return false;
+}
+
+/**
  * Validates whether a text block consists of coherent English text rather than
  * drawing noise, pencil sketch artifacts, isolated letters, or OCR hallucinations.
  */
@@ -153,6 +197,11 @@ export function isCoherentEnglishText(text: string): boolean {
   if (!text) return false;
   const clean = text.trim();
   if (clean.length < 2) return false;
+
+  // Reject drawing/face sketch noise immediately
+  if (isDrawingOrSketchNoise(clean)) {
+    return false;
+  }
 
   // 1. Symbol density check: if text is mostly punctuation, slashes, dashes, or symbols
   const lettersAndDigits = (clean.match(/[a-zA-Z0-9]/g) || []).length;

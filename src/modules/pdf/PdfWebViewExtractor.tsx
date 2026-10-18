@@ -90,7 +90,7 @@ async function ocrCanvas(canvas) {
           });
           if (response.ok) {
             var json = await response.json();
-            if (json && json.success && Array.isArray(json.items) && json.items.length > 0) {
+            if (json && json.success && Array.isArray(json.items)) {
               return json.items;
             }
           }
