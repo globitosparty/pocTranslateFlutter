@@ -63,28 +63,73 @@ export default function DualViewerScreen({
   const [translatedDisplayMode, setTranslatedDisplayMode] = useState<'overlay' | 'text'>('overlay');
   const [copiedToast, setCopiedToast] = useState(false);
 
-  // Smart font size calculation for translated text overlaid on bounding boxes
-  const getAdaptiveFontSize = (box?: { x: number; y: number; width: number; height: number }, textLength: number = 20): number => {
-    if (!box) return 12;
-    const approxHeightPx = 700 * (box.height || 0.03);
-    const approxWidthPx = 520 * (box.width || 0.3);
+  // Smart typography extrapolation: dynamically calculates fontSize and lineHeight
+  // so translated text naturally fills the entire bounding box area from top to bottom
+  const getExtrapolatedTypography = (
+    box?: { x: number; y: number; width: number; height: number },
+    text: string = ''
+  ): { fontSize: number; lineHeight: number } => {
+    if (!box || !text) return { fontSize: 13, lineHeight: 18 };
 
-    // Test from large title size down to body text size
-    for (let size = 32; size >= 8; size--) {
-      const charsPerLine = Math.max(1, Math.floor(approxWidthPx / (size * 0.52)));
-      const lines = Math.ceil(textLength / charsPerLine);
-      const neededH = lines * (size * 1.25);
+    const approxW = Math.max(520 * (box.width || 0.3), 50);
+    const approxH = Math.max(700 * (box.height || 0.05), 18);
+    const words = text.split(/\s+/).filter(Boolean);
 
-      // Single line text: scale directly with the box height
-      if (lines === 1 && size <= Math.max(approxHeightPx * 0.92, 10)) {
-        return size;
+    let best = { fontSize: 11, lineHeight: 15, score: -1 };
+
+    // Search from large font sizes down to compact sizes
+    for (let size = 36; size >= 8; size -= 0.5) {
+      const charW = size * 0.52;
+      const charsPerLine = Math.max(1, Math.floor((approxW - 8) / charW));
+
+      let lines = 1;
+      let curLen = 0;
+      for (const w of words) {
+        if (curLen + w.length + 1 > charsPerLine) {
+          lines++;
+          curLen = w.length;
+        } else {
+          curLen += (curLen === 0 ? 0 : 1) + w.length;
+        }
       }
-      // Multi-line text: ensure total block fits comfortably
-      if (lines > 1 && neededH <= Math.max(approxHeightPx * 1.25, lines * 10)) {
-        return size;
+
+      const availableH = approxH - 6;
+      const targetLineHeight = availableH / lines;
+
+      // 1. Single line: scale directly with box height
+      if (lines === 1 && size <= approxH * 0.85 && charW * text.length <= approxW - 8) {
+        const score = size * 4;
+        if (score > best.score) {
+          best = { fontSize: size, lineHeight: Math.round(Math.max(size * 1.15, availableH)), score };
+        }
+      }
+      // 2. Multi-line: perfect proportional fill
+      else if (targetLineHeight >= size * 1.15 && targetLineHeight <= size * 2.2) {
+        const totalH = lines * targetLineHeight;
+        const fillRatio = totalH / availableH;
+        const score = size * 2.5 + fillRatio * 15;
+        if (score > best.score) {
+          best = { fontSize: size, lineHeight: Math.round(targetLineHeight), score };
+        }
+      }
+      // 3. Tall box: cap line height to comfortable readable spacing
+      else if (targetLineHeight > size * 2.2) {
+        const capped = Math.round(size * 1.6);
+        const score = size * 2;
+        if (score > best.score) {
+          best = { fontSize: size, lineHeight: capped, score };
+        }
+      }
+      // 4. Snug fit for compact blocks
+      else if (targetLineHeight >= size * 1.05 && lines > 1) {
+        const score = size * 1.4;
+        if (score > best.score) {
+          best = { fontSize: size, lineHeight: Math.round(targetLineHeight), score };
+        }
       }
     }
-    return 8;
+
+    return { fontSize: best.fontSize, lineHeight: best.lineHeight };
   };
 
   // Jump to page modal
@@ -579,14 +624,14 @@ export default function DualViewerScreen({
                               ]}
                             >
                               {translated ? (() => {
-                                const fSize = getAdaptiveFontSize(p.box, translated.length);
+                                const { fontSize, lineHeight } = getExtrapolatedTypography(p.box, translated);
                                 return (
                                   <Text
                                     style={[
                                       styles.overlayText,
                                       {
-                                        fontSize: fSize,
-                                        lineHeight: Math.max(11, Math.round(fSize * 1.25))
+                                        fontSize,
+                                        lineHeight
                                       }
                                     ]}
                                   >
@@ -598,15 +643,15 @@ export default function DualViewerScreen({
                                   <ActivityIndicator size="small" color={activeTheme.accent} />
                                 </View>
                               ) : (() => {
-                                const fSize = getAdaptiveFontSize(p.box, p.text.length);
+                                const { fontSize, lineHeight } = getExtrapolatedTypography(p.box, p.text);
                                 return (
                                   <Text
                                     style={[
                                       styles.overlayText,
                                       styles.overlayTextPending,
                                       {
-                                        fontSize: fSize,
-                                        lineHeight: Math.max(11, Math.round(fSize * 1.25))
+                                        fontSize,
+                                        lineHeight
                                       }
                                     ]}
                                   >
@@ -961,10 +1006,11 @@ const styles = StyleSheet.create({
     position: 'absolute',
     backgroundColor: '#FFFFFF',
     borderRadius: 2,
-    paddingHorizontal: 3,
-    paddingVertical: 1,
+    paddingHorizontal: 4,
+    paddingVertical: 2,
     borderWidth: 0.5,
     overflow: 'hidden',
+    justifyContent: 'center',
     shadowColor: '#000000',
     shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.1,
